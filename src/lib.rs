@@ -132,13 +132,27 @@ impl OplTimer {
         }
     }
 
-    fn enable(&mut self, state: bool) {
-        self.enabled = state;
+    fn set_preset(&mut self, preset: u8) {
+        self.preset = preset;
     }
 
-    #[allow(dead_code)]
+    fn enable(&mut self, state: bool) {
+        let was_enabled = self.enabled;
+        self.enabled = state;
+
+        // Setting ST1/ST2 loads the preset value and starts counting from there.
+        if state && !was_enabled {
+            self.counter = self.preset;
+            self.usec_accumulator = 0.0;
+        }
+    }
+
     fn reset(&mut self) {
-        self.counter = self.preset;
+        self.enabled = false;
+        self.masked = false;
+        self.preset = 0;
+        self.counter = 0;
+        self.usec_accumulator = 0.0;
         self.elapsed = false;
     }
 
@@ -157,11 +171,13 @@ impl OplTimer {
     #[inline]
     fn count(&mut self) {
         if self.enabled {
-            if self.counter == 255 {
+            let (next_counter, overflowed) = self.counter.overflowing_add(1);
+
+            if overflowed {
                 self.elapsed = true;
                 self.counter = self.preset;
             } else {
-                self.counter += 1;
+                self.counter = next_counter;
             }
         }
     }
@@ -280,6 +296,7 @@ impl Opl3Device {
             OplRegisterFile::Primary => self.addr_reg[0] = addr,
             OplRegisterFile::Secondary => self.addr_reg[1] = addr,
         }
+        self.stats.addr_writes = self.stats.addr_writes.saturating_add(1);
         Ok(())
     }
 
@@ -366,10 +383,10 @@ impl Opl3Device {
         if let OplRegisterFile::Primary = file {
             match reg {
                 OPL_TIMER_1_REGISTER => {
-                    self.timers[0].counter = value;
+                    self.timers[0].set_preset(value);
                 }
                 OPL_TIMER_2_REGISTER => {
-                    self.timers[1].counter = value;
+                    self.timers[1].set_preset(value);
                 }
                 OPL_TIMER_CONTROL_REGISTER => {
                     if (value & OPL_IRQ_FLAG) != 0 {
@@ -412,11 +429,21 @@ impl Opl3Device {
     pub fn reset(&mut self, sample_rate: Option<u32>) -> Result<(), OplError> {
         let new_sample_rate = sample_rate.unwrap_or(self.sample_rate);
         self.inner_chip.reset(new_sample_rate);
+        self.sample_rate = new_sample_rate;
+        self.addr_reg = [0, 0];
+        self.samples_fpart = 0.0;
+        self.usec_accumulator = 0.0;
+
         for file in 0..2 {
             for reg in 0..256 {
                 self.registers[file][reg] = 0;
             }
         }
+
+        for timer in &mut self.timers {
+            timer.reset();
+        }
+
         self.stats = Opl3DeviceStats::default();
         Ok(())
     }
@@ -433,7 +460,9 @@ impl Opl3Device {
     ///
     /// A Result containing either `()` on success or an `OplError` on failure.
     pub fn generate(&mut self, sample: &mut [i16]) -> Result<(), OplError> {
-        self.inner_chip.generate(sample)
+        self.inner_chip.generate(sample)?;
+        self.stats.samples_generated = self.stats.samples_generated.saturating_add(1);
+        Ok(())
     }
 
     /// Generate a stream of 2 channel, interleaved audio samples in i16 format.
@@ -447,7 +476,12 @@ impl Opl3Device {
     ///
     /// A Result containing either `()` on success or an `OplError` on failure.
     pub fn generate_samples(&mut self, buffer: &mut [i16]) -> Result<(), OplError> {
-        self.inner_chip.generate_stream(buffer)
+        self.inner_chip.generate_stream(buffer)?;
+        self.stats.samples_generated = self
+            .stats
+            .samples_generated
+            .saturating_add(buffer.len() / 2);
+        Ok(())
     }
 }
 
